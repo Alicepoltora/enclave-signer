@@ -46,6 +46,15 @@ message EnrichedPsbtPayload {
   bytes consignment_hash = 13;
 }
 
+// --- Listener -> Enclave (plain BTC: create_utxo / plain withdrawals) ---
+// Dispatch: SignRequest with data_type BTC_UTXO. Carries no RGB consignment
+// and no EVM correlation. The enclave authorises it solely against an
+// operator-pinned output allowlist + amount cap (see SignBtcRequest), so the
+// listener supplies nothing the enclave has to trust beyond the raw PSBT.
+message EnrichedBtcPayload {
+  bytes psbt_bytes = 1;
+}
+
 // --- Listener -> Enclave (RGB -> EVM: EVM signing) ---
 // Dispatch: SignRequest with data_type SWAP.
 

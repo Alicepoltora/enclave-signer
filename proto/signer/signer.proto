@@ -13,6 +13,15 @@ enum DataType {
   UNSPENDABLE = 4;
   OWNER_MULTIPLE_SIGNATURE = 5;
   EVM_GAS_TX = 6;
+  // Plain-BTC PSBT signing (create_utxo, plain BTC withdrawals) that carries
+  // no RGB consignment and no EVM correlation. Routed to a dedicated enclave
+  // handler that enforces a pinned output allowlist + amount cap — NOT the
+  // bridge/RGB SignPsbt path. Making this an explicit type (rather than
+  // inferring "plain BTC" from an empty evm_tx_hash on a TRANSACTION payload)
+  // is the M-01/#69 fix: the bridge path can no longer be reached by field
+  // omission, and an un-migrated listener that omits the consignment on a
+  // TRANSACTION payload fails closed instead of silently signing.
+  BTC_UTXO = 7;
 }
 
 message SignRequest {

@@ -16,6 +16,20 @@ fn pinned_bridge_config() -> BridgeConfig {
         chain_id: 1,
         bridge_contract: [0xAA; 20],
         rgb_asset_id: "rgb:test".into(),
+        ..Default::default()
+    }
+}
+
+/// Pinned `BridgeConfig` for the plain-BTC (`SignBtc`) path: pins a single
+/// allowed output `script_pubkey` and a total-output cap, so the plain-BTC
+/// cross-check has a concrete allowlist to enforce. Mirrors how #81's
+/// `gas_pinned_config()` pins the gas-tx destination.
+#[allow(dead_code)]
+fn btc_pinned_config(allowed_script: Vec<u8>, max_total_sats: u64) -> BridgeConfig {
+    BridgeConfig {
+        btc_allowed_scripts: vec![allowed_script],
+        btc_max_total_sats: max_total_sats,
+        ..Default::default()
     }
 }
 
@@ -107,6 +121,58 @@ fn minimal_valid_psbt_bytes() -> Vec<u8> {
     Psbt::from_unsigned_tx(unsigned_tx)
         .expect("from_unsigned_tx")
         .serialize()
+}
+
+/// Build a one-input, one-output PSBT for the plain-BTC (`SignBtc`) tests. The
+/// input carries a populated `witness_utxo` (`input_spk`/`input_sats`) so the
+/// validator can classify (P2WSH vs not) and bound it; the output pays
+/// `output_spk` for `output_sats`. The signer won't actually sign it (no
+/// matchable keys), so use it for tests expecting a cross-check rejection or a
+/// 0-input signed response.
+#[allow(dead_code)]
+fn btc_psbt(
+    input_spk: bitcoin::ScriptBuf,
+    input_sats: u64,
+    output_spk: bitcoin::ScriptBuf,
+    output_sats: u64,
+) -> Vec<u8> {
+    use bitcoin::hashes::Hash;
+    use bitcoin::psbt::Psbt;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+
+    let unsigned_tx = Transaction {
+        version: bitcoin::transaction::Version(2),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                    [0u8; 32],
+                )),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(output_sats),
+            script_pubkey: output_spk,
+        }],
+    };
+    let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).expect("from_unsigned_tx");
+    psbt.inputs[0].witness_utxo = Some(TxOut {
+        value: Amount::from_sat(input_sats),
+        script_pubkey: input_spk,
+    });
+    psbt.serialize()
+}
+
+/// A deterministic P2WPKH script_pubkey — a bridge-controlled plain
+/// output/input script for the plain-BTC tests.
+#[allow(dead_code)]
+fn btc_test_script(seed: u8) -> bitcoin::ScriptBuf {
+    use bitcoin::hashes::Hash;
+    bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([seed; 20]))
 }
 
 /// Build a minimal 2-of-3 multisig PSBT for testing with a known pubkey.
@@ -319,6 +385,7 @@ fn test_sign_evm_rejects_unconfigured_bridge_config() {
         chain_id: 0,
         bridge_contract: [0u8; 20],
         rgb_asset_id: String::new(),
+        ..Default::default()
     };
     let port = common::start_test_server_with_config(|_| {}, unconfigured);
 
@@ -554,11 +621,15 @@ fn test_sign_psbt_rejects_amount_mismatch() {
 }
 
 // =============================================================================
-// Vanilla PSBT signing tests (create_utxo — no EVM cross-checks)
+// M-01/#69: bridge SignPsbt no longer has a vanilla bypass
 // =============================================================================
 
+// In a production (rgb-validation) build, a SignPsbt with no consignment is
+// rejected fail-closed — the empty-`evm_tx_hash` "vanilla mode" that used to
+// skip every bridge predicate is gone. This is the core M-01 regression gate.
+#[cfg(feature = "rgb-validation")]
 #[test]
-fn test_sign_vanilla_psbt_skips_evm_checks() {
+fn test_sign_psbt_requires_consignment_under_rgb_validation() {
     let port = common::start_test_server();
 
     let init_req = EnclaveRequest {
@@ -569,14 +640,12 @@ fn test_sign_vanilla_psbt_skips_evm_checks() {
     };
     common::send_request(port, &init_req);
 
-    // Vanilla PSBT: empty evm_tx_hash, no EVM enrichment.
-    // This would fail bridge-mode cross-checks (evm_event_valid=false, etc.)
-    // but should pass in vanilla mode.
+    // No EVM correlation AND no consignment — exactly the old bypass shape.
     let sign_req = EnclaveRequest {
         request: Some(Request::SignPsbt(SignPsbtRequest {
-            evm_tx_hash: vec![], // empty = vanilla mode
+            evm_tx_hash: vec![],
             operation_idx: 0,
-            evm_event_valid: false, // would fail in bridge mode
+            evm_event_valid: false,
             evm_event_finalized: false,
             evm_token: vec![],
             evm_amount: 0,
@@ -591,24 +660,276 @@ fn test_sign_vanilla_psbt_skips_evm_checks() {
     };
     let resp = common::send_request(port, &sign_req);
 
-    // Vanilla mode skips the EVM cross-checks even though `evm_event_valid`
-    // is false. The PSBT shape check now passes (real BIP-174 bytes), and
-    // the signer returns 0 matchable inputs successfully — no key material
-    // in this PSBT lines up with the test seed.
     match &resp.response {
         Some(Response::Error(e)) => {
-            // Should NOT be a cross-check error (code 3) — vanilla mode
-            // is the whole point of this test.
-            assert_ne!(
+            assert_eq!(
                 e.code, 3,
-                "vanilla PSBT should not fail cross-checks, but got: {}",
+                "expected cross-check rejection, got: {}",
+                e.message
+            );
+            assert!(
+                e.message.contains("requires a consignment"),
+                "expected consignment-required rejection, got: {}",
                 e.message
             );
         }
-        Some(Response::SignedPsbt(_)) => {
-            // Expected with the new minimal-valid PSBT shape.
-        }
+        other => panic!(
+            "vanilla SignPsbt must fail closed under rgb-validation, got: {:?}",
+            other
+        ),
+    }
+}
+
+// In a default (non-production) build there is no in-enclave consignment
+// validator, so the consignment gate is compiled out and the request-level
+// validation simply no longer short-circuits on an empty evm_tx_hash. This
+// pins that the request-level check itself does not reject a no-EVM payload
+// (the fail-closed gate is the rgb-validation-only consignment binding above).
+#[cfg(not(feature = "rgb-validation"))]
+#[test]
+fn test_sign_psbt_no_evm_correlation_passes_request_level_in_default_build() {
+    let port = common::start_test_server();
+
+    let init_req = EnclaveRequest {
+        request: Some(Request::InitializeKey(InitializeKeyRequest {
+            seed: vec![],
+            mnemonic: String::new(),
+        })),
+    };
+    common::send_request(port, &init_req);
+
+    let sign_req = EnclaveRequest {
+        request: Some(Request::SignPsbt(SignPsbtRequest {
+            evm_tx_hash: vec![],
+            operation_idx: 0,
+            evm_event_valid: false,
+            evm_event_finalized: false,
+            evm_token: vec![],
+            evm_amount: 0,
+            evm_recipient: vec![],
+            evm_commission: 0,
+            psbt_bytes: minimal_valid_psbt_bytes(),
+            psbt_output_amount: 0,
+            rgb_asset_id: String::new(),
+            consignment: vec![],
+            consignment_hash: vec![],
+        })),
+    };
+    let resp = common::send_request(port, &sign_req);
+
+    match &resp.response {
+        Some(Response::Error(e)) => assert_ne!(
+            e.code, 3,
+            "request-level validation should not raise a cross-check error here, got: {}",
+            e.message
+        ),
+        Some(Response::SignedPsbt(_)) => {}
         other => panic!("unexpected response: {:?}", other),
+    }
+}
+
+// =============================================================================
+// Plain-BTC signing (SignBtc): structural input guard + pinned allowlist + cap
+// =============================================================================
+
+fn init_server(port: u16) {
+    let init_req = EnclaveRequest {
+        request: Some(Request::InitializeKey(InitializeKeyRequest {
+            seed: vec![],
+            mnemonic: String::new(),
+        })),
+    };
+    common::send_request(port, &init_req);
+}
+
+#[test]
+fn test_sign_btc_before_init() {
+    let allowed = btc_test_script(0x11);
+    let port = common::start_test_server_with_config(
+        |_| {},
+        btc_pinned_config(allowed.as_bytes().to_vec(), 100_000),
+    );
+
+    // Valid policy (non-P2WSH input, under cap, allowlisted output) so the only
+    // reason to fail is the uninitialized key.
+    let sign_req = EnclaveRequest {
+        request: Some(Request::SignBtc(SignBtcRequest {
+            psbt_bytes: btc_psbt(btc_test_script(0x11), 60_000, allowed, 50_000),
+        })),
+    };
+    let resp = common::send_request(port, &sign_req);
+
+    assert!(
+        matches!(&resp.response, Some(Response::Error(_))),
+        "SignBtc before init should return error"
+    );
+}
+
+// The structural M-01 guard for the plain-BTC path — the enclave refuses to
+// co-sign a Colored (RGB-allocated) input under SignBtc's vanilla-only signing
+// scope — is exercised at the unit level in
+// `signing::taproot::tests::scoped_vanilla_refuses_a_colored_input` (it needs a
+// known seed + a colored-account tapscript, which the integration harness's
+// random init key can't construct). The integration tests below cover the
+// operator-pinned destination/amount policy layer.
+
+#[test]
+fn test_sign_btc_rejects_non_allowlisted_output() {
+    let allowed = btc_test_script(0x11);
+    let port = common::start_test_server_with_config(
+        |_| {},
+        btc_pinned_config(allowed.as_bytes().to_vec(), 100_000),
+    );
+    init_server(port);
+
+    // Input is fine, but pays an address the operator did NOT pin.
+    let sign_req = EnclaveRequest {
+        request: Some(Request::SignBtc(SignBtcRequest {
+            psbt_bytes: btc_psbt(btc_test_script(0x11), 60_000, btc_test_script(0x99), 10_000),
+        })),
+    };
+    let resp = common::send_request(port, &sign_req);
+
+    match &resp.response {
+        Some(Response::Error(e)) => {
+            assert_eq!(e.code, 3);
+            assert!(
+                e.message.contains("non-allowlisted"),
+                "expected allowlist rejection, got: {}",
+                e.message
+            );
+        }
+        other => panic!("expected ErrorResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_sign_btc_rejects_input_value_over_cap() {
+    let allowed = btc_test_script(0x11);
+    let port = common::start_test_server_with_config(
+        |_| {},
+        btc_pinned_config(allowed.as_bytes().to_vec(), 100_000),
+    );
+    init_server(port);
+
+    // Allowlisted destination, but the input value spent exceeds the cap.
+    let sign_req = EnclaveRequest {
+        request: Some(Request::SignBtc(SignBtcRequest {
+            psbt_bytes: btc_psbt(btc_test_script(0x11), 200_000, allowed, 50_000),
+        })),
+    };
+    let resp = common::send_request(port, &sign_req);
+
+    match &resp.response {
+        Some(Response::Error(e)) => {
+            assert_eq!(e.code, 3);
+            assert!(
+                e.message.contains("exceeds pinned cap"),
+                "expected cap rejection, got: {}",
+                e.message
+            );
+        }
+        other => panic!("expected ErrorResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_sign_btc_accepts_allowlisted_under_cap() {
+    let allowed = btc_test_script(0x11);
+    let port = common::start_test_server_with_config(
+        |_| {},
+        btc_pinned_config(allowed.as_bytes().to_vec(), 100_000),
+    );
+    init_server(port);
+
+    let sign_req = EnclaveRequest {
+        request: Some(Request::SignBtc(SignBtcRequest {
+            psbt_bytes: btc_psbt(btc_test_script(0x11), 60_000, allowed, 50_000),
+        })),
+    };
+    let resp = common::send_request(port, &sign_req);
+
+    // Passes policy; the test seed matches no input. With the inputs_signed==0
+    // guard this returns a (non-cross-check) Signing error rather than a code-3
+    // policy rejection — assert only that policy did not reject it.
+    match &resp.response {
+        Some(Response::SignedPsbt(_)) => {}
+        Some(Response::Error(e)) => assert_ne!(
+            e.code, 3,
+            "allowlisted output under cap should pass policy, got: {}",
+            e.message
+        ),
+        other => panic!("unexpected response: {:?}", other),
+    }
+}
+
+// A production (rgb-validation) build refuses plain-BTC signing when the
+// allowlist/cap are unconfigured — fail-closed, mirroring the EVM path.
+#[cfg(feature = "rgb-validation")]
+#[test]
+fn test_sign_btc_unconfigured_fails_closed_under_rgb_validation() {
+    // Unconfigured BridgeConfig (no BTC_ALLOWED_SCRIPTS / BTC_MAX_TOTAL_SATS).
+    let port = common::start_test_server_with_config(|_| {}, BridgeConfig::default());
+    init_server(port);
+
+    let sign_req = EnclaveRequest {
+        request: Some(Request::SignBtc(SignBtcRequest {
+            // Non-P2WSH input (passes the structural guard) so the failure is
+            // specifically the unconfigured-policy fail-closed.
+            psbt_bytes: btc_psbt(btc_test_script(0x11), 10_000, btc_test_script(0x11), 9_000),
+        })),
+    };
+    let resp = common::send_request(port, &sign_req);
+
+    match &resp.response {
+        Some(Response::Error(e)) => {
+            assert_eq!(e.code, 3);
+            assert!(
+                e.message.contains("requires BTC_ALLOWED_SCRIPTS"),
+                "expected fail-closed-unconfigured rejection, got: {}",
+                e.message
+            );
+        }
+        other => panic!(
+            "unconfigured plain-BTC signing must fail closed under rgb-validation, got: {:?}",
+            other
+        ),
+    }
+}
+
+// A production build also refuses plain-BTC signing under a HALF-pin (allowlist
+// set but cap unset, or vice-versa) — the half-pin is treated as unconfigured.
+#[cfg(feature = "rgb-validation")]
+#[test]
+fn test_sign_btc_half_pin_fails_closed_under_rgb_validation() {
+    let allowed = btc_test_script(0x11);
+    // allowlist set, cap == 0 (unset) → half-pin → unconfigured
+    let port = common::start_test_server_with_config(
+        |_| {},
+        btc_pinned_config(allowed.as_bytes().to_vec(), 0),
+    );
+    init_server(port);
+
+    let sign_req = EnclaveRequest {
+        request: Some(Request::SignBtc(SignBtcRequest {
+            psbt_bytes: btc_psbt(btc_test_script(0x11), 10_000, allowed, 9_000),
+        })),
+    };
+    let resp = common::send_request(port, &sign_req);
+
+    match &resp.response {
+        Some(Response::Error(e)) => {
+            assert_eq!(e.code, 3);
+            assert!(
+                e.message.contains("requires BTC_ALLOWED_SCRIPTS"),
+                "expected half-pin fail-closed rejection, got: {}",
+                e.message
+            );
+        }
+        other => panic!(
+            "half-pin plain-BTC signing must fail closed under rgb-validation, got: {:?}",
+            other
+        ),
     }
 }
 

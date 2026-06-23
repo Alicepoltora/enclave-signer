@@ -111,7 +111,8 @@ impl ParentAdapterService {
 impl EnclaveService for ParentAdapterService {
     /// Sign — dispatches based on data_type + network_id:
     ///   TRANSACTION + EVM network_id → deserialize EnrichedEvmPayload → SignEvmRequest
-    ///   TRANSACTION + other          → deserialize EnrichedPsbtPayload → SignPsbtRequest
+    ///   TRANSACTION + other          → deserialize EnrichedPsbtPayload → SignPsbtRequest (bridge/RGB-send)
+    ///   BTC_UTXO                     → deserialize EnrichedBtcPayload → SignBtcRequest (plain BTC)
     ///   EVM_GAS_TX                   → raw 32-byte digest → SignRawDigestRequest
     async fn sign(&self, request: Request<SignRequest>) -> Result<Response<Signature>, Status> {
         let inner = request.into_inner();
@@ -210,6 +211,28 @@ impl EnclaveService for ParentAdapterService {
                 EnclaveRequest {
                     request: Some(enclave_request::Request::SignRawDigest(
                         enclave_proto::SignRawDigestRequest { digest: inner.data },
+                    )),
+                }
+            }
+            DataType::BtcUtxo => {
+                let payload =
+                    enriched::EnrichedBtcPayload::decode(inner.data.as_slice()).map_err(|e| {
+                        Status::invalid_argument(format!(
+                            "failed to decode EnrichedBtcPayload: {e}"
+                        ))
+                    })?;
+
+                tracing::info!(
+                    network_id = inner.network_id,
+                    psbt_len = payload.psbt_bytes.len(),
+                    "gRPC Sign: plain BTC (data_type=BTC_UTXO)"
+                );
+
+                EnclaveRequest {
+                    request: Some(enclave_request::Request::SignBtc(
+                        enclave_proto::SignBtcRequest {
+                            psbt_bytes: payload.psbt_bytes,
+                        },
                     )),
                 }
             }

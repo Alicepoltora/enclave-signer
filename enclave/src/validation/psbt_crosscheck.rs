@@ -5,51 +5,77 @@ use crate::proto::SignPsbtRequest;
 #[cfg(feature = "rgb-validation")]
 use crate::validation::rgb::{ifa, ValidatedConsignment};
 
-/// Validate enriched SignPsbtRequest before signing.
+/// Shape whitelist for a raw PSBT. Mirrors the EVM-side selector whitelist:
+/// refuse payloads that aren't even a legitimate PSBT before any other
+/// predicate runs. Catches three classes of garbage up-front:
 ///
-/// Two modes:
-/// - **Bridge mode** (evm_tx_hash is non-empty): Full cross-checks — EVM event
-///   must be valid + finalized, amounts must match, tx hash must be 32 bytes.
-///   Used for EVM→RGB bridge operations.
-/// - **Vanilla mode** (evm_tx_hash is empty): Minimal checks — PSBT must be
-///   present. Used for `create_utxo` and other plain BTC operations that don't
-///   involve RGB state or EVM events.
-pub fn validate_psbt_request(req: &SignPsbtRequest) -> Result<()> {
-    // 0. Shape whitelist. Mirrors the EVM-side selector whitelist: refuse
-    //    payloads that aren't even a legitimate PSBT before any other
-    //    predicate runs. Catches three classes of garbage up-front:
-    //
-    //      (a) empty bytes (handler tried to sign nothing),
-    //      (b) bytes that don't conform to BIP-174 (random/truncated/
-    //          tampered),
-    //      (c) PSBTs with no inputs — there's literally nothing to sign,
-    //          and the unsigned-tx-must-be-non-empty rule is implicit in
-    //          BIP-174's signing semantics.
-    //
-    //    The existing PSBT signer would have failed later on these too,
-    //    but with a much noisier downstream error. Failing here gives the
-    //    caller a single clear reason.
-    if req.psbt_bytes.is_empty() {
+///   (a) empty bytes (handler tried to sign nothing),
+///   (b) bytes that don't conform to BIP-174 (random/truncated/tampered),
+///   (c) PSBTs with no inputs — there's literally nothing to sign, and the
+///       unsigned-tx-must-be-non-empty rule is implicit in BIP-174's signing
+///       semantics.
+///
+/// The signer would fail later on these too, but with a much noisier
+/// downstream error; failing here gives the caller a single clear reason.
+/// Shared by the bridge/RGB `SignPsbt` path and the plain-BTC `SignBtc` path.
+pub(crate) fn parse_psbt_shape(psbt_bytes: &[u8]) -> Result<Psbt> {
+    if psbt_bytes.is_empty() {
         return Err(EnclaveError::CrossCheck("psbt_bytes is empty".into()));
     }
-    let psbt = Psbt::deserialize(&req.psbt_bytes)
+    let psbt = Psbt::deserialize(psbt_bytes)
         .map_err(|e| EnclaveError::CrossCheck(format!("psbt_bytes is not a valid PSBT: {e}")))?;
     if psbt.unsigned_tx.input.is_empty() {
         return Err(EnclaveError::CrossCheck(
             "psbt has no inputs — nothing to sign".into(),
         ));
     }
+    Ok(psbt)
+}
 
-    // Vanilla mode: no EVM enrichment → skip bridge cross-checks.
+/// Validate a bridge/RGB-send `SignPsbtRequest` before signing.
+///
+/// This is the EVM-lock → RGB-send direction. There is **no "vanilla mode"**:
+/// the empty-`evm_tx_hash` early-return that used to skip every bridge
+/// predicate was the M-01/#69 bypass and has been removed. Plain-BTC
+/// operations (create_utxo, plain withdrawals) now travel a *separate* request
+/// type (`SignBtc` / [`super::btc_crosscheck`]) and never reach this function.
+///
+/// What this function enforces:
+///   1. **Shape** — the payload is a real, non-empty, input-bearing PSBT.
+///   2. **EVM enrichment (when present)** — if the listener supplied an
+///      `evm_tx_hash`, the accompanying EVM fields must be self-consistent
+///      (32-byte hash, event valid + finalized, deposit ≥ output + commission).
+///      These remain *listener-asserted* booleans (M-02/#51 tracks replacing
+///      them with self-verified EVM finality) — they are validated here only
+///      as a shape/consistency gate, not trusted as proof.
+///
+/// The authoritative authorization for an RGB-send is the **consignment
+/// binding** enforced in [`crate::server`]'s `psbt_consignment_crosscheck`
+/// (now run unconditionally under `rgb-validation`, regardless of whether an
+/// `evm_tx_hash` is present): a production enclave refuses to sign a `SignPsbt`
+/// that does not carry a consignment it validates and binds the PSBT to. That
+/// is the fail-closed gate; this function is the cheap pre-check.
+pub fn validate_psbt_request(req: &SignPsbtRequest) -> Result<()> {
+    // 0. Shape whitelist.
+    parse_psbt_shape(&req.psbt_bytes)?;
+
+    // 1. EVM enrichment is optional on this path. The pools/hub send-RGB flow
+    //    carries no EVM correlation at all (the consignment is the binding);
+    //    only the EVM-correlated lock flow sets evm_tx_hash. When it is set we
+    //    validate its self-consistency; when absent there is nothing to check
+    //    here and the consignment gate in the handler does the real work. We
+    //    no longer return Ok early on an empty evm_tx_hash — that was the
+    //    bypass.
     if req.evm_tx_hash.is_empty() {
-        tracing::info!("PSBT signing: vanilla mode (no evm_tx_hash, skipping EVM cross-checks)");
+        tracing::info!(
+            "PSBT signing: no EVM correlation (send-RGB authorized by consignment binding)"
+        );
         return Ok(());
     }
 
-    // Bridge mode: full EVM cross-checks.
-    tracing::info!("PSBT signing: bridge mode (evm_tx_hash present, full cross-checks)");
+    tracing::info!("PSBT signing: EVM-correlated (validating enrichment fields)");
 
-    // 1. Tx hash must be exactly 32 bytes
+    // 1a. Tx hash must be exactly 32 bytes
     if req.evm_tx_hash.len() != 32 {
         return Err(EnclaveError::CrossCheck(format!(
             "evm_tx_hash must be 32 bytes, got {}",
@@ -57,21 +83,21 @@ pub fn validate_psbt_request(req: &SignPsbtRequest) -> Result<()> {
         )));
     }
 
-    // 2. EVM event must be valid
+    // 1b. EVM event must be valid
     if !req.evm_event_valid {
         return Err(EnclaveError::CrossCheck(
             "EVM event not validated by Listener".into(),
         ));
     }
 
-    // 3. EVM event must be finalized
+    // 1c. EVM event must be finalized
     if !req.evm_event_finalized {
         return Err(EnclaveError::CrossCheck(
             "EVM event not yet finalized".into(),
         ));
     }
 
-    // 4. Amount consistency: EVM deposit must cover PSBT output + commission
+    // 1d. Amount consistency: EVM deposit must cover PSBT output + commission
     let required = req
         .psbt_output_amount
         .checked_add(req.evm_commission)
@@ -260,9 +286,13 @@ mod tests {
         }
     }
 
-    fn vanilla_psbt_request() -> SignPsbtRequest {
+    /// A SignPsbt request with no EVM correlation (empty evm_tx_hash) — the
+    /// pools/hub send-RGB shape. Request-level validation accepts it (the
+    /// consignment gate in the handler is what authorizes it); it is NOT the
+    /// old "vanilla mode" that skipped every bridge predicate.
+    fn no_evm_psbt_request() -> SignPsbtRequest {
         SignPsbtRequest {
-            evm_tx_hash: vec![], // empty = vanilla mode
+            evm_tx_hash: vec![], // no EVM correlation
             operation_idx: 0,
             evm_event_valid: false,
             evm_event_finalized: false,
@@ -279,26 +309,29 @@ mod tests {
     }
 
     // =========================================================================
-    // Vanilla mode tests
+    // No-EVM-correlation (send-RGB) request-level tests
     // =========================================================================
 
     #[test]
-    fn vanilla_psbt_passes_with_minimal_fields() {
-        assert!(validate_psbt_request(&vanilla_psbt_request()).is_ok());
+    fn no_evm_psbt_passes_request_level_shape_check() {
+        // Request-level validation only checks shape here; the consignment
+        // binding gate (server.rs) is what actually authorizes the sign.
+        assert!(validate_psbt_request(&no_evm_psbt_request()).is_ok());
     }
 
     #[test]
-    fn vanilla_psbt_rejects_empty_psbt() {
-        let mut req = vanilla_psbt_request();
+    fn no_evm_psbt_rejects_empty_psbt() {
+        let mut req = no_evm_psbt_request();
         req.psbt_bytes = vec![];
         let err = validate_psbt_request(&req).unwrap_err();
         assert!(err.to_string().contains("psbt_bytes is empty"));
     }
 
     #[test]
-    fn vanilla_psbt_ignores_evm_fields() {
-        // Even though evm_event_valid is false, vanilla mode doesn't check it.
-        let mut req = vanilla_psbt_request();
+    fn no_evm_psbt_does_not_check_evm_enrichment_fields() {
+        // With no evm_tx_hash, the EVM enrichment booleans are not consulted
+        // at the request level (the consignment gate is the authorization).
+        let mut req = no_evm_psbt_request();
         req.evm_event_valid = false;
         req.evm_event_finalized = false;
         assert!(validate_psbt_request(&req).is_ok());
@@ -363,13 +396,13 @@ mod tests {
     }
 
     // =========================================================================
-    // PSBT shape whitelist tests — apply to both bridge and vanilla modes
+    // PSBT shape whitelist tests — apply to both EVM-correlated and no-EVM paths
     // =========================================================================
 
     #[test]
     fn rejects_garbage_psbt_bytes() {
         // Long enough to clear the empty-bytes guard but not a BIP-174 PSBT.
-        let mut req = vanilla_psbt_request();
+        let mut req = no_evm_psbt_request();
         req.psbt_bytes = vec![0xFF; 100];
         let err = validate_psbt_request(&req).unwrap_err();
         assert!(
@@ -381,7 +414,7 @@ mod tests {
     #[test]
     fn rejects_truncated_psbt_below_magic() {
         // Shorter than the 5-byte BIP-174 magic prefix.
-        let mut req = vanilla_psbt_request();
+        let mut req = no_evm_psbt_request();
         req.psbt_bytes = vec![0x70, 0x73];
         let err = validate_psbt_request(&req).unwrap_err();
         assert!(
@@ -405,7 +438,7 @@ mod tests {
             }],
         };
         let psbt = Psbt::from_unsigned_tx(unsigned_tx).expect("from_unsigned_tx");
-        let mut req = vanilla_psbt_request();
+        let mut req = no_evm_psbt_request();
         req.psbt_bytes = psbt.serialize();
         let err = validate_psbt_request(&req).unwrap_err();
         assert!(

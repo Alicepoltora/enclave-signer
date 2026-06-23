@@ -19,6 +19,7 @@ message EnclaveRequest {
     SubmitHeadersRequest      submit_headers        = 11;
     GetLastSavedBlockRequest  get_last_saved_block  = 12;
     GetAttestedPublicKeyRequest get_attested_public_key = 13;
+    SignBtcRequest            sign_btc              = 14;
   }
 }
 
@@ -199,6 +200,20 @@ message SignPsbtRequest {
 message SignedPsbtResponse {
   bytes signed_psbt    = 1; // Serialized PSBT with our partial signature(s) added
   uint32 inputs_signed = 2; // Number of inputs we signed
+}
+
+// === Plain-BTC PSBT Signing (create_utxo / plain withdrawals) ===
+//
+// Distinct from SignPsbtRequest (the bridge/RGB-send path). This path carries
+// NO RGB consignment and NO EVM correlation: it exists for plain-BTC ops the
+// bridge legitimately performs (e.g. create_utxo UTXO management, plain BTC
+// withdrawals). The enclave authorises it ONLY against an operator-pinned
+// output allowlist + amount cap (env BTC_ALLOWED_SCRIPTS / BTC_MAX_TOTAL_SATS),
+// never a listener-supplied flag. A production (rgb-validation) build refuses
+// to sign on this path when the allowlist/cap are unconfigured (fail-closed).
+// Response is a SignedPsbtResponse, same as SignPsbt.
+message SignBtcRequest {
+  bytes psbt_bytes = 1;  // Raw PSBT to sign (plain BTC; no consignment)
 }
 
 // === Raw Message Signing (fundsIn authorization) ===

@@ -73,6 +73,14 @@ fn start_mock_enclave() -> u16 {
                         },
                     )),
                 },
+                Some(enclave_request::Request::SignBtc(_)) => EnclaveResponse {
+                    response: Some(enclave_response::Response::SignedPsbt(
+                        enclave_proto::SignedPsbtResponse {
+                            signed_psbt: vec![0xBC; 80],
+                            inputs_signed: 1,
+                        },
+                    )),
+                },
                 Some(enclave_request::Request::InitializeKey(_)) => EnclaveResponse {
                     response: Some(enclave_response::Response::InitializeKey(
                         enclave_proto::InitializeKeyResponse {
@@ -339,6 +347,61 @@ async fn grpc_sign_psbt_roundtrip() {
         !resp.signature.is_empty(),
         "signed PSBT should not be empty"
     );
+}
+
+#[tokio::test]
+async fn grpc_sign_btc_roundtrip() {
+    // BTC_UTXO routes the EnrichedBtcPayload to a SignBtcRequest and returns a
+    // signed PSBT — the plain-BTC path is distinct from TRANSACTION/SignPsbt.
+    let enclave_port = start_mock_enclave();
+    let grpc_port = start_grpc_server(enclave_port).await;
+
+    let mut client = EnclaveServiceClient::connect(format!("http://127.0.0.1:{grpc_port}"))
+        .await
+        .unwrap();
+
+    let payload = enriched::EnrichedBtcPayload {
+        psbt_bytes: vec![0x70, 0x73, 0x62, 0x74, 0xFF],
+    };
+
+    let req = SignRequest {
+        network_id: 0,
+        data_type: DataType::BtcUtxo as i32,
+        data: payload.encode_to_vec(),
+        inputs: vec![],
+        algorithm: None,
+    };
+
+    let resp = client.sign(req).await.unwrap().into_inner();
+    assert_eq!(
+        resp.signature,
+        vec![0xBC; 80],
+        "BTC_UTXO should route to SignBtc and return its signed PSBT"
+    );
+}
+
+#[tokio::test]
+async fn grpc_btc_utxo_rejects_invalid_payload() {
+    // Garbage bytes that aren't a valid EnrichedBtcPayload must be rejected at
+    // the boundary, not forwarded.
+    let enclave_port = start_mock_enclave();
+    let grpc_port = start_grpc_server(enclave_port).await;
+
+    let mut client = EnclaveServiceClient::connect(format!("http://127.0.0.1:{grpc_port}"))
+        .await
+        .unwrap();
+
+    // A truncated varint-length prefix is an undecodable protobuf.
+    let req = SignRequest {
+        network_id: 0,
+        data_type: DataType::BtcUtxo as i32,
+        data: vec![0x0a, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        inputs: vec![],
+        algorithm: None,
+    };
+
+    let status = client.sign(req).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
 }
 
 #[tokio::test]

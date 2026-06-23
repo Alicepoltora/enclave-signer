@@ -91,6 +91,10 @@ fn dispatch(request: EnclaveRequest, ctx: &ServerContext) -> EnclaveResponse {
             tracing::info!("request: SignPsbt");
             handle_sign_psbt(ctx, req)
         }
+        Some(Request::SignBtc(req)) => {
+            tracing::info!("request: SignBtc");
+            handle_sign_btc(ctx, req)
+        }
         Some(Request::SignRawMessage(req)) => {
             tracing::info!("request: SignRawMessage");
             handle_sign_raw_message(&ctx.state, req)
@@ -500,23 +504,72 @@ fn handle_sign_evm(ctx: &ServerContext, req: SignEvmRequest) -> Result<EnclaveRe
 }
 
 fn handle_sign_psbt(ctx: &ServerContext, req: SignPsbtRequest) -> Result<EnclaveResponse> {
-    // Cross-check enriched fields before signing (skipped in dev-mode)
+    // Cross-check enriched fields before signing (skipped in dev-mode). This is
+    // the bridge/RGB-send path; plain-BTC ops travel SignBtc (handle_sign_btc).
     #[cfg(not(feature = "dev-mode"))]
     validation::psbt_crosscheck::validate_psbt_request(&req)?;
 
-    // Send-RGB (EVM-lock → RGB-send) consignment binding. In bridge mode the
-    // PSBT being signed IS the RGB transfer's witness transaction; bind it to
-    // the validated consignment so a signed PSBT can't move bridge BTC without
-    // finalizing the claimed RGB transition. Vanilla mode (empty evm_tx_hash,
-    // e.g. create_utxo) carries no consignment and skips this entirely.
+    // Send-RGB (EVM-lock → RGB-send) consignment binding. The PSBT being signed
+    // IS the RGB transfer's witness transaction; bind it to the validated
+    // consignment so a signed PSBT can't move bridge BTC without finalizing the
+    // claimed RGB transition. This runs UNCONDITIONALLY under rgb-validation —
+    // it is the fail-closed gate for this path (M-01/#69). It no longer keys off
+    // `evm_tx_hash`: the pools/hub send-RGB flow carries no EVM correlation, so
+    // the consignment (not the EVM hash) is the authorization. A SignPsbt with
+    // no consignment is rejected by `psbt_consignment_crosscheck` rather than
+    // silently signed — which is also what an un-migrated listener (sending a
+    // plain-BTC op on this path by mistake) now hits: a hard reject, not a wave-
+    // through. Genuinely plain-BTC ops must use SignBtc instead.
     #[cfg(all(feature = "rgb-validation", not(feature = "dev-mode")))]
-    if !req.evm_tx_hash.is_empty() {
-        psbt_consignment_crosscheck(ctx, &req)?;
-    }
+    psbt_consignment_crosscheck(ctx, &req)?;
 
     let (signed_psbt, inputs_signed) = ctx.state.sign_psbt(&req.psbt_bytes)?;
 
     tracing::info!(inputs_signed, "PSBT signed");
+
+    Ok(EnclaveResponse {
+        response: Some(Response::SignedPsbt(SignedPsbtResponse {
+            signed_psbt,
+            inputs_signed: inputs_signed as u32,
+        })),
+    })
+}
+
+/// Sign a plain-BTC PSBT (create_utxo / plain withdrawals). Distinct from
+/// [`handle_sign_psbt`]: this path carries no RGB consignment and no EVM event.
+/// The enclave authorizes it solely against the operator-pinned output
+/// allowlist + amount cap ([`validation::btc_crosscheck`]); a production
+/// (rgb-validation) build refuses to sign when that policy is unconfigured.
+/// Routing plain-BTC ops through their own request type is the structural half
+/// of the M-01/#69 fix — the bridge `SignPsbt` path can no longer be reached by
+/// omitting its fields.
+fn handle_sign_btc(ctx: &ServerContext, req: SignBtcRequest) -> Result<EnclaveResponse> {
+    // Pinned output allowlist + amount cap (skipped only in dev-mode).
+    #[cfg(not(feature = "dev-mode"))]
+    validation::btc_crosscheck::validate_btc_request(&req, &ctx.bridge_config)?;
+
+    // Sign restricted to the VANILLA (plain-BTC) account: the enclave will not
+    // co-sign a Colored (RGB-allocated) input on this path, so it is
+    // structurally impossible for plain-BTC signing to move federation/RGB
+    // funds — those move only via the consignment-bound SignPsbt path. createUtxos
+    // and sendBtc spend only vanilla-account UTXOs, so this never blocks a
+    // legitimate plain-BTC op.
+    let (signed_psbt, inputs_signed) = ctx
+        .state
+        .sign_psbt_scoped(&req.psbt_bytes, Some(crate::keys::AccountType::Vanilla))?;
+
+    // Mirror the bridge path's W-03 guard: a 0-input signing is a no-op and
+    // must not be returned as a successful signature in production.
+    #[cfg(not(feature = "dev-mode"))]
+    if inputs_signed == 0 {
+        return Err(EnclaveError::Signing(
+            "sign_btc signed 0 inputs: no PSBT input belongs to this enclave — refusing to \
+             return a no-op as a successful signing response"
+                .into(),
+        ));
+    }
+
+    tracing::info!(inputs_signed, "plain-BTC PSBT signed");
 
     Ok(EnclaveResponse {
         response: Some(Response::SignedPsbt(SignedPsbtResponse {

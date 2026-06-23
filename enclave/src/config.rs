@@ -21,11 +21,26 @@
 use crate::error::{EnclaveError, Result};
 
 /// Bridge config pinned at enclave boot from env. See module docs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BridgeConfig {
     pub chain_id: u64,
     pub bridge_contract: [u8; 20],
     pub rgb_asset_id: String,
+    /// Operator-pinned output allowlist for the **plain-BTC** signing path
+    /// (`SignBtc`, env `BTC_ALLOWED_SCRIPTS`): the set of output
+    /// `script_pubkey` byte-strings the enclave will co-sign a plain-BTC PSBT
+    /// toward (e.g. the bridge's own change/UTXO-management scripts). Empty =
+    /// unset; a production (`rgb-validation`) build refuses plain-BTC signing
+    /// when unset. Like the gas-tx destination pin (`GAS_TX_ALLOWED_TO`), this
+    /// is an operational signing-policy pin, NOT part of `is_configured()` or
+    /// the attested identity bundle — see the C-01 systemic follow-up for
+    /// attesting it.
+    pub btc_allowed_scripts: Vec<Vec<u8>>,
+    /// Operator-pinned cap (sats) on the **total** output value of a plain-BTC
+    /// PSBT (`BTC_MAX_TOTAL_SATS`). `0` = unset; a production build refuses
+    /// plain-BTC signing when unset. Bounds the blast radius of the plain-BTC
+    /// path independently of the destination allowlist.
+    pub btc_max_total_sats: u64,
 }
 
 impl BridgeConfig {
@@ -46,10 +61,30 @@ impl BridgeConfig {
 
         let rgb_asset_id = std::env::var("RGB_ASSET_ID").unwrap_or_default();
 
+        // Plain-BTC output allowlist: comma-separated hex `script_pubkey`s.
+        // Each entry is parsed independently; malformed/empty entries are
+        // dropped rather than poisoning the whole list.
+        let btc_allowed_scripts = std::env::var("BTC_ALLOWED_SCRIPTS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|part| hex::decode(part.trim()).ok())
+                    .filter(|bytes| !bytes.is_empty())
+                    .collect::<Vec<Vec<u8>>>()
+            })
+            .unwrap_or_default();
+
+        let btc_max_total_sats = std::env::var("BTC_MAX_TOTAL_SATS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
         Self {
             chain_id,
             bridge_contract,
             rgb_asset_id,
+            btc_allowed_scripts,
+            btc_max_total_sats,
         }
     }
 
@@ -111,6 +146,7 @@ mod tests {
             chain_id: 0,
             bridge_contract: [0u8; 20],
             rgb_asset_id: String::new(),
+            ..Default::default()
         };
         assert!(!c.is_configured());
     }
@@ -121,6 +157,7 @@ mod tests {
             chain_id: 1,
             bridge_contract: [0u8; 20],
             rgb_asset_id: String::new(),
+            ..Default::default()
         };
         assert!(c.is_configured());
     }
