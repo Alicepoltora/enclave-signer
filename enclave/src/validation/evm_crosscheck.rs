@@ -157,11 +157,17 @@ pub fn validate_evm_request(req: &SignEvmRequest, bridge_config: &BridgeConfig) 
         }
 
         // 1b. Hash integrity check between listener-supplied bytes and the
-        //     pre-computed keccak. Full RGB validation
-        //     (`rgbstd::Transfer::validate` against an Esplora resolver)
-        //     happens in `handle_sign_evm` before this function runs; the
-        //     hash check is the defence-in-depth tamper detection on the
-        //     wire copy.
+        //     pre-computed keccak. This is INTEGRITY, NOT AUTHORIZATION
+        //     (audit I-02 / Oxorio I-09): the listener controls BOTH
+        //     `consignment` and `consignment_hash`, so a match only proves the
+        //     wire copy was not corrupted in transit - it says nothing about
+        //     whether the consignment authorizes this release. Authorization
+        //     comes solely from the independent in-enclave RGB validation
+        //     (`rgbstd::Transfer::validate` against an Esplora resolver, run in
+        //     `handle_sign_evm` before this function), SPV anchoring, and the
+        //     binding of validated facts (contract_id / op_id / amount). Keep
+        //     this as defence-in-depth tamper detection; never read a hash
+        //     match as proof of intent.
         if req.consignment_hash.is_empty() {
             return Err(EnclaveError::CrossCheck(
                 "consignment present but consignment_hash is missing".into(),
@@ -362,6 +368,32 @@ pub fn assert_witnesses_confirmed(validated: &ValidatedConsignment) -> Result<()
     Ok(())
 }
 
+/// Fail-closed selector guard shared by the selector-specific `fundsOut`
+/// validators ([`validate_funds_out_transfer`] / [`validate_funds_out_burn`]).
+///
+/// Both are only meaningful for the `fundsOut` selector
+/// ([`FUNDS_OUT_SELECTOR_POOLS`]), which [`validate_evm_request`] has already
+/// whitelisted before the handler invokes them. Each previously returned
+/// `Ok(())` for any other selector, so a future refactor that called one
+/// directly - skipping that whitelist - would get a *silent success* for an
+/// unsupported selector (audit I-03 / Oxorio I-10: caller-ordering instead of
+/// failing closed). Reject instead: a selector-specific validator handed the
+/// wrong selector is a programming error, so fail closed rather than pass.
+///
+/// Full typed-intent dispatch (a `FundsOutCall` enum classified once and
+/// threaded through the handler) is deferred to the mint/burn epic
+/// (#57 / #59 / #66); this guard just removes the latent silent-success path.
+#[cfg(feature = "rgb-validation")]
+fn ensure_funds_out_selector(call_data: &[u8], validator: &str) -> Result<()> {
+    if call_data.len() < 4 || call_data[..4] != FUNDS_OUT_SELECTOR_POOLS {
+        return Err(EnclaveError::CrossCheck(format!(
+            "{validator} called with a non-fundsOut selector - selector-specific validators must \
+             only run after the whitelist in validate_evm_request"
+        )));
+    }
+    Ok(())
+}
+
 /// Mint/burn-side amount cross-check for the unlock flow.
 ///
 /// **Not wired into the handler yet.** The contract exposes a single
@@ -386,15 +418,14 @@ pub fn assert_witnesses_confirmed(validated: &ValidatedConsignment) -> Result<()
 ///   3. The calldata's `amount` (at [`FUNDS_OUT_AMOUNT_OFFSET`]) must be
 ///      ≤ the burned amount. Equal is fine; over is the attack we block.
 ///
-/// A no-op for any other selector.
+/// Fails closed (does not no-op) if handed anything but the `fundsOut`
+/// selector - see [`ensure_funds_out_selector`] (audit I-03).
 #[cfg(feature = "rgb-validation")]
 pub fn validate_funds_out_burn(
     req: &SignEvmRequest,
     validated: &ValidatedConsignment,
 ) -> Result<()> {
-    if req.call_data.len() < 4 || req.call_data[..4] != FUNDS_OUT_SELECTOR_POOLS {
-        return Ok(());
-    }
+    ensure_funds_out_selector(&req.call_data, "validate_funds_out_burn")?;
 
     let last = validated.last_transition.as_ref().ok_or_else(|| {
         EnclaveError::CrossCheck(
@@ -449,16 +480,15 @@ pub fn validate_funds_out_burn(
 /// The contract's `fundsOut` carries no commission slot (commission is
 /// taken on-chain by `CommissionManager`), so only `amount` is checked.
 ///
-/// A no-op for any other selector — same dispatch convention as
-/// [`validate_funds_out_burn`].
+/// Fails closed (does not no-op) if handed anything but the `fundsOut`
+/// selector - same guard as [`validate_funds_out_burn`], see
+/// [`ensure_funds_out_selector`] (audit I-03).
 #[cfg(feature = "rgb-validation")]
 pub fn validate_funds_out_transfer(
     req: &SignEvmRequest,
     validated: &ValidatedConsignment,
 ) -> Result<()> {
-    if req.call_data.len() < 4 || req.call_data[..4] != FUNDS_OUT_SELECTOR_POOLS {
-        return Ok(());
-    }
+    ensure_funds_out_selector(&req.call_data, "validate_funds_out_transfer")?;
 
     let last = validated.last_transition.as_ref().ok_or_else(|| {
         EnclaveError::CrossCheck(
@@ -1222,17 +1252,20 @@ mod tests {
             );
         }
 
+        /// Regression guard for audit I-03: a selector-specific validator
+        /// handed a selector that isn't `fundsOut` must **fail closed**, not
+        /// silently succeed. Pair it with an otherwise-valid burn consignment
+        /// so the only reason to reject is the wrong selector.
         #[test]
-        fn no_op_for_non_funds_out_selector() {
-            // Calldata with a selector that isn't `fundsOut` —
-            // `validate_funds_out_burn` must not run any burn-side checks
-            // against it. Pair it with a deliberately-bad consignment
-            // (Transfer with no burn metadata) to make sure the function
-            // bails before reading anything.
-            let mut req = req_with_calldata(vec![0u8; 100]);
+        fn rejects_non_funds_out_selector() {
+            let mut req = req_with_calldata(mock_mintburn_calldata(500));
             req.call_data[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-            let validated = validated_with_last(burn_transition(None));
-            assert!(validate_funds_out_burn(&req, &validated).is_ok());
+            let validated = validated_with_last(burn_transition(Some(500)));
+            let err = validate_funds_out_burn(&req, &validated).unwrap_err();
+            assert!(
+                err.to_string().contains("non-fundsOut selector"),
+                "expected wrong-selector rejection, got: {err}"
+            );
         }
     }
 
@@ -1394,15 +1427,18 @@ mod tests {
             );
         }
 
+        /// Regression guard for audit I-03: fail closed on a non-`fundsOut`
+        /// selector rather than silently no-opping the transfer-side checks.
         #[test]
-        fn no_op_for_non_funds_out_selector() {
-            // Calldata with a selector that isn't `fundsOut` —
-            // `validate_funds_out_transfer` must not run any transfer-side
-            // checks against it.
-            let mut req = req_with_calldata(vec![0u8; 4 + 8 * 32]);
+        fn rejects_non_funds_out_selector() {
+            let mut req = req_with_calldata(mock_pools_calldata(0));
             req.call_data[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
             let validated = validated_with_last(transfer_transition(0));
-            assert!(validate_funds_out_transfer(&req, &validated).is_ok());
+            let err = validate_funds_out_transfer(&req, &validated).unwrap_err();
+            assert!(
+                err.to_string().contains("non-fundsOut selector"),
+                "expected wrong-selector rejection, got: {err}"
+            );
         }
     }
 
