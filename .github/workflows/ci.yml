@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
+          components: rustfmt, clippy
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+
+      # The `rgb-consignment` dep (used by the rgb-validation / spv
+      # feature combos) is hosted in a private repo and fetched over
+      # SSH. Load a read-only deploy key registered on
+      # UTEXO-Protocol/rgb-consignment-parser into the agent so cargo's
+      # `git fetch` can authenticate. Default-feature jobs don't pull
+      # the dep and run without this; every job below that enables
+      # `rgb-validation` or `spv` requires it.
+      - name: Set up SSH for private RGB deps
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.RGB_CONSIGNMENT_PARSER_DEPLOY_KEY }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build (default features)
+        run: cargo build --workspace
+
+      # `--all-targets` so clippy lints test code too — otherwise lints on
+      # files under `tests/` slip through, as happened on the attestation PR.
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test (default features)
+        run: cargo test --workspace
+
+      # Production build profile: vsock + rgb-validation + spv. Catches any
+      # regression on the actual feature combination shipped in the EIF.
+      - name: Build (production combo)
+        run: cargo build -p utexo-bridge-enclave --features vsock,rgb-validation,spv
+
+      - name: Clippy (production combo)
+        run: cargo clippy -p utexo-bridge-enclave --features vsock,rgb-validation,spv --all-targets -- -D warnings
+
+      # SPV path coverage. Cannot use vsock here (Linux runner without
+      # vsock support); spv pulls in rgb-validation transitively, which is
+      # what the SPV unit + integration tests exercise.
+      - name: Test (--features spv)
+        run: cargo test -p utexo-bridge-enclave --features spv
+
+  # Assert the dev-only features `compile_error!` in a release build, so a
+  # misconfigured Dockerfile / CI matrix can never ship one. Each feature is
+  # built individually with `--release`; the build MUST fail, and fail via
+  # our guard rather than some unrelated error. Runs separately from `ci`
+  # because these builds are expected to fail.
+  release-guards:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [allow-seed-import, mock-attestation, dev-mode]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+
+      # `rgb-consignment` is an optional git dep, but cargo still resolves
+      # (and fetches) it from its pinned lockfile revision even when the
+      # feature is off — so the build needs the deploy key to reach the
+      # `compile_error!`, just like the `ci` job above.
+      - name: Set up SSH for private RGB deps
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.RGB_CONSIGNMENT_PARSER_DEPLOY_KEY }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-guards-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-guards-
+
+      - name: Assert release build is rejected with ${{ matrix.feature }}
+        run: |
+          if cargo build -p utexo-bridge-enclave --release --features ${{ matrix.feature }} 2>build.log; then
+            echo "::error::release build unexpectedly SUCCEEDED with '${{ matrix.feature }}' — the compile_error release guard is missing or not firing"
+            exit 1
+          fi
+          if ! grep -q "must not be enabled in a release build" build.log; then
+            echo "::error::release build failed, but not via the expected compile_error guard for '${{ matrix.feature }}'"
+            cat build.log
+            exit 1
+          fi
+          echo "OK: release build correctly rejected '${{ matrix.feature }}' via the compile_error guard"
