@@ -944,3 +944,64 @@ fn test_proxy_federation_returns_not_ready() {
         other => panic!("expected ErrorResponse, got {:?}", other),
     }
 }
+
+
+// =============================================================================
+// Lost-response recovery test (Issue #220)
+// =============================================================================
+//
+// Before the fix, `op_replay_guard.check_and_record` was called BEFORE
+// `framing::write_message`. If the response was lost during write, the
+// operation was already recorded, and a retry would be rejected as a
+// duplicate. This test verifies that the replay guard works correctly
+// after the fix: the first sign_psbt succeeds and records the op;
+// a second identical request is correctly rejected by the guard.
+// The key behavioral change is that check_and_record now happens
+// AFTER write_message in `process_connection`, so if write fails,
+// the op is never recorded and the retry succeeds.
+
+#[test]
+#[cfg(feature = "allow-seed-import")]
+fn test_sign_psbt_replay_guard_records_after_signing() {
+    let port = common::start_test_server();
+
+    let seed = [0x42u8; 64];
+    let init_req = EnclaveRequest {
+        request: Some(Request::InitializeKey(InitializeKeyRequest {
+            seed: seed.to_vec(),
+            mnemonic: String::new(),
+        })),
+    };
+    let init_resp = common::send_request(port, &init_req);
+    assert!(
+        matches!(&init_resp.response, Some(Response::InitializeKey(_))),
+        "init should succeed"
+    );
+
+    let psbt_bytes = minimal_valid_psbt_bytes();
+    let sign_req = EnclaveRequest {
+        request: Some(Request::SignPsbt(valid_sign_psbt_request(psbt_bytes))),
+    };
+
+    // First sign_psbt should succeed.
+    let sign_resp1 = common::send_request(port, &sign_req);
+    match &sign_resp1.response {
+        Some(Response::SignedPsbt(r)) => {
+            assert!(r.inputs_signed > 0, "should have signed at least one input");
+        }
+        other => panic!("expected SignedPsbtResponse, got {:?}", other),
+    }
+
+    // Second identical sign_psbt should be rejected by the replay guard.
+    let sign_resp2 = common::send_request(port, &sign_req);
+    match &sign_resp2.response {
+        Some(Response::Error(e)) => {
+            assert!(
+                e.message.contains("duplicate bridge operation"),
+                "expected replay guard rejection, got: {}",
+                e.message
+            );
+        }
+        other => panic!("expected ErrorResponse from replay guard, got {:?}", other),
+    }
+}

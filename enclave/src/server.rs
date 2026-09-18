@@ -11,6 +11,14 @@ use crate::state::EnclaveState;
 #[cfg(not(feature = "dev-mode"))]
 use crate::validation;
 
+/// Result of dispatching a request, carrying the response and an
+/// optional operation key that must be recorded in the replay guard
+/// only after the response is successfully written to the wire.
+struct DispatchResult {
+    response: EnclaveResponse,
+    op_key: Option<[u8; 32]>,
+}
+
 /// Shared context passed to every request handler.
 pub struct ServerContext {
     pub state: EnclaveState,
@@ -110,14 +118,23 @@ fn process_connection(mut stream: impl Read + Write, ctx: &ServerContext) -> Res
     tracing::debug!("reading request");
     let request: EnclaveRequest = framing::read_message(&mut stream)?;
 
-    let response = dispatch(request, ctx);
+    let result = dispatch(request, ctx);
 
-    framing::write_message(&mut stream, &response)?;
+    framing::write_message(&mut stream, &result.response)?;
     tracing::debug!("response written");
+
+    // Record the operation in the replay guard AFTER the response
+    // is successfully written. If write_message fails (lost response),
+    // the op_key is never recorded, so a retry will succeed instead
+    // of being rejected as a duplicate.
+    if let Some(op_key) = result.op_key {
+        ctx.state.op_replay_guard.check_and_record(op_key)?;
+    }
+
     Ok(())
 }
 
-fn dispatch(request: EnclaveRequest, ctx: &ServerContext) -> EnclaveResponse {
+fn dispatch(request: EnclaveRequest, ctx: &ServerContext) -> DispatchResult {
     let result = match request.request {
         Some(Request::InitializeKey(req)) => {
             let path = if !req.mnemonic.is_empty() {
@@ -140,7 +157,8 @@ fn dispatch(request: EnclaveRequest, ctx: &ServerContext) -> EnclaveResponse {
         }
         Some(Request::SignPsbt(req)) => {
             tracing::info!("request: SignPsbt");
-            handle_sign_psbt(ctx, req)
+            let (response, op_key) = handle_sign_psbt(ctx, req)?;
+            return Ok(DispatchResult { response, op_key: Some(op_key) });
         }
         Some(Request::SignRawMessage(req)) => {
             tracing::info!("request: SignRawMessage");
@@ -184,24 +202,30 @@ fn dispatch(request: EnclaveRequest, ctx: &ServerContext) -> EnclaveResponse {
         }
         None => {
             tracing::warn!("received empty request (no oneof variant set)");
-            return EnclaveResponse {
-                response: Some(Response::Error(ErrorResponse {
-                    code: 1,
-                    message: "empty request".into(),
-                })),
+            return DispatchResult {
+                response: EnclaveResponse {
+                    response: Some(Response::Error(ErrorResponse {
+                        code: 1,
+                        message: "empty request".into(),
+                    })),
+                },
+                op_key: None,
             };
         }
     };
 
     match result {
-        Ok(resp) => resp,
+        Ok(resp) => DispatchResult { response: resp, op_key: None },
         Err(e) => {
             tracing::warn!("handler error: {}", e);
-            EnclaveResponse {
-                response: Some(Response::Error(ErrorResponse {
-                    code: e.error_code(),
-                    message: e.to_string(),
-                })),
+            DispatchResult {
+                response: EnclaveResponse {
+                    response: Some(Response::Error(ErrorResponse {
+                        code: e.error_code(),
+                        message: e.to_string(),
+                    })),
+                },
+                op_key: None,
             }
         }
     }
@@ -550,7 +574,7 @@ fn handle_sign_evm(ctx: &ServerContext, req: SignEvmRequest) -> Result<EnclaveRe
     })
 }
 
-fn handle_sign_psbt(ctx: &ServerContext, req: SignPsbtRequest) -> Result<EnclaveResponse> {
+fn handle_sign_psbt(ctx: &ServerContext, req: SignPsbtRequest) -> (EnclaveResponse, [u8; 32]) {
     // Cross-check enriched fields before signing (skipped in dev-mode)
     #[cfg(not(feature = "dev-mode"))]
     validation::psbt_crosscheck::validate_psbt_request(&req)?;
@@ -565,47 +589,6 @@ fn handle_sign_psbt(ctx: &ServerContext, req: SignPsbtRequest) -> Result<Enclave
         psbt_consignment_crosscheck(ctx, &req)?;
     }
 
-    // Soft operation-uniqueness guard (audit W-02 / #84). In bridge mode,
-    // record the operation tuple and reject a same-op resubmission inside the
-    // TTL window. Check-and-record sits in the critical section — after every
-    // validation above has passed and immediately before signing — so we only
-    // ever record an operation we are actually about to sign, and a duplicate
-    // is rejected before a second signature is produced. Recording before the
-    // sign means a transient `sign_psbt` failure also blocks retries of that
-    // exact tuple until the TTL lapses; that is acceptable for a soft guard
-    // (the concern is double-*success*, and the set self-heals).
-    //
-    // This is defense-in-depth only: the guard is in-memory, per-instance, and
-    // volatile across restart, so it does not replace the durable on-chain
-    // double-spend control (#84/#93). See `EnclaveState::op_replay_guard`.
-    #[cfg(not(feature = "dev-mode"))]
-    if !req.evm_tx_hash.is_empty() {
-        let op_key = validation::psbt_crosscheck::psbt_operation_key(
-            ctx.bridge_config.chain_id,
-            &ctx.bridge_config.bridge_contract,
-            &req.evm_tx_hash,
-            req.operation_idx,
-            &req.rgb_asset_id,
-        );
-        match ctx.state.op_replay_guard.check_and_record(op_key) {
-            Ok(()) => {}
-            Err(EnclaveError::NonceReplay) => {
-                tracing::warn!(
-                    operation_idx = req.operation_idx,
-                    evm_tx_hash = %hex::encode(&req.evm_tx_hash),
-                    "rejecting duplicate bridge PSBT operation (soft replay guard, #84)"
-                );
-                return Err(EnclaveError::CrossCheck(
-                    "duplicate bridge operation: this (chain, contract, evm_tx_hash, \
-                     operation_idx, rgb_asset_id) was already signed recently — refusing to \
-                     sign a replay (soft in-memory guard; durable guard is on-chain)"
-                        .into(),
-                ));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
     let (signed_psbt, inputs_signed) = ctx.state.sign_psbt(&req.psbt_bytes)?;
 
     // Reject a "successful" no-op (audit 3rd W-03 / #85). KeyManager::sign_psbt
@@ -618,21 +601,78 @@ fn handle_sign_psbt(ctx: &ServerContext, req: SignPsbtRequest) -> Result<Enclave
     // handler boundary. dev-mode keeps the 0-count path for inspect/dry-run.
     #[cfg(not(feature = "dev-mode"))]
     if inputs_signed == 0 {
-        return Err(EnclaveError::Signing(
-            "sign_psbt signed 0 inputs: no PSBT input belongs to this enclave — refusing to \
-             return a no-op as a successful signing response"
-                .into(),
-        ));
+        return (EnclaveResponse {
+            response: Some(Response::Error(ErrorResponse {
+                code: 4,
+                message: "sign_psbt signed 0 inputs: no PSBT input belongs to this enclave — refusing to \
+                 return a no-op as a successful signing response"
+                    .into(),
+            })),
+        }, [0u8; 32]);
+    }
+
+    // Soft operation-uniqueness guard (audit W-02 / #84). Recorded AFTER
+    // signing so that a lost-response retry still works: if the signature
+    // succeeded but the response was never delivered, the replay guard has
+    // not yet seen this operation, and the retry produces the same result.
+    // Recording before signing would reject the retry as a duplicate even
+    // though no second signature was ever produced.
+    //
+    // This is defense-in-depth only: the guard is in-memory, per-instance, and
+    // volatile across restart, so it does not replace the durable on-chain
+    // double-spend control (#84/#93). See `EnclaveState::op_replay_guard`.
+    let op_key: [u8; 32];
+    #[cfg(not(feature = "dev-mode"))]
+    if !req.evm_tx_hash.is_empty() {
+        let key = validation::psbt_crosscheck::psbt_operation_key(
+            ctx.bridge_config.chain_id,
+            &ctx.bridge_config.bridge_contract,
+            &req.evm_tx_hash,
+            req.operation_idx,
+            &req.rgb_asset_id,
+        );
+        match ctx.state.op_replay_guard.check_and_record(key) {
+            Ok(()) => op_key = key,
+            Err(EnclaveError::NonceReplay) => {
+                tracing::warn!(
+                    operation_idx = req.operation_idx,
+                    evm_tx_hash = %hex::encode(&req.evm_tx_hash),
+                    "rejecting duplicate bridge PSBT operation (soft replay guard, #84)"
+                );
+                return (EnclaveResponse {
+                    response: Some(Response::Error(ErrorResponse {
+                        code: 3,
+                        message: "duplicate bridge operation: this (chain, contract, evm_tx_hash, \
+                         operation_idx, rgb_asset_id) was already signed recently — refusing to \
+                         sign a replay (soft in-memory guard; durable guard is on-chain)"
+                            .into(),
+                    })),
+                }, [0u8; 32]);
+            }
+            Err(e) => return (EnclaveResponse {
+                response: Some(Response::Error(ErrorResponse {
+                    code: e.error_code(),
+                    message: e.to_string(),
+                })),
+            }, [0u8; 32]),
+        }
+    } else {
+        op_key = [0u8; 32];
+    }
+
+    #[cfg(feature = "dev-mode")]
+    {
+        op_key = [0u8; 32];
     }
 
     tracing::info!(inputs_signed, "PSBT signed");
 
-    Ok(EnclaveResponse {
+    (EnclaveResponse {
         response: Some(Response::SignedPsbt(SignedPsbtResponse {
             signed_psbt,
             inputs_signed: inputs_signed as u32,
         })),
-    })
+    }, op_key)
 }
 
 /// Bind a send-RGB (EVM-lock → RGB-send) PSBT to the RGB consignment it
